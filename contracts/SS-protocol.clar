@@ -271,3 +271,125 @@
     (ok true)
   )
 )
+
+
+(define-public (get-subscription-status (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+    )
+    (ok (get active subscription))
+  )
+)
+(define-public (get-subscription-expiry (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+    )
+    (ok (get end-time subscription))
+  )
+)
+(define-public (get-subscription-last-payment (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+    )
+    (ok (get last-payment subscription))
+  )
+)
+
+
+(define-map subscription-tiers
+  { tier-id: uint, plan-id: uint }
+  {
+    name: (string-ascii 32),
+    benefits: (list 10 (string-ascii 64)),
+    multiplier: uint
+  }
+)
+
+(define-data-var next-tier-id uint u1)
+
+(define-read-only (get-tier-details (tier-id uint) (plan-id uint))
+  (map-get? subscription-tiers { tier-id: tier-id, plan-id: plan-id })
+)
+
+(define-public (add-subscription-tier 
+    (plan-id uint)
+    (name (string-ascii 32))
+    (benefits (list 10 (string-ascii 64)))
+    (price-multiplier uint)
+  )
+  (let
+    (
+      (tier-id (var-get next-tier-id))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: plan-id }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (map-set subscription-tiers
+      { tier-id: tier-id, plan-id: plan-id }
+      {
+        name: name,
+        benefits: benefits,
+        multiplier: price-multiplier
+      }
+    )
+    (var-set next-tier-id (+ tier-id u1))
+    (ok tier-id)
+  )
+)
+
+
+(define-map referral-codes
+  { code: (string-ascii 16) }
+  {
+    owner: principal,
+    uses: uint,
+    active: bool
+  }
+)
+
+(define-map referral-rewards
+  { user: principal }
+  { total-earned: uint }
+)
+
+(define-constant referral-reward-percentage u500)
+
+(define-read-only (get-referral-stats (code (string-ascii 16)))
+  (map-get? referral-codes { code: code })
+)
+
+(define-public (create-referral-code (code (string-ascii 16)))
+  (begin
+    (asserts! (is-none (map-get? referral-codes { code: code })) err-already-exists)
+    (map-set referral-codes
+      { code: code }
+      {
+        owner: tx-sender,
+        uses: u0,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (subscribe-with-referral (plan-id uint) (referral-code (string-ascii 16)))
+  (let
+    (
+      (referral (unwrap! (map-get? referral-codes { code: referral-code }) err-not-found))
+      (subscription-result (try! (subscribe plan-id)))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: plan-id }) err-not-found))
+      (reward-amount (/ (* (get price plan) referral-reward-percentage) u10000))
+    )
+    (asserts! (get active referral) err-invalid-subscription)
+    (try! (as-contract (stx-transfer? reward-amount tx-sender (get owner referral))))
+    (map-set referral-codes
+      { code: referral-code }
+      (merge referral { uses: (+ (get uses referral) u1) })
+    )
+    (ok subscription-result)
+  )
+)
