@@ -393,3 +393,195 @@
     (ok subscription-result)
   )
 )
+
+
+
+(define-map provider-metrics
+  { provider-id: uint, period: uint }
+  {
+    total-subscriptions: uint,
+    active-subscriptions: uint,
+    total-revenue: uint,
+    new-subscribers: uint,
+    churned-subscribers: uint,
+    renewal-count: uint,
+    last-updated: uint
+  }
+)
+
+(define-map subscription-events
+  { event-id: uint }
+  {
+    provider-id: uint,
+    subscription-id: uint,
+    event-type: (string-ascii 16),
+    amount: uint,
+    timestamp: uint,
+    subscriber: principal
+  }
+)
+
+(define-map provider-revenue-history
+  { provider-id: uint, block-height: uint }
+  {
+    period-revenue: uint,
+    cumulative-revenue: uint,
+    subscriber-count: uint
+  }
+)
+
+(define-map churn-analytics
+  { provider-id: uint }
+  {
+    total-churned: uint,
+    churn-rate: uint,
+    avg-subscription-length: uint,
+    last-calculated: uint
+  }
+)
+
+(define-data-var next-event-id uint u1)
+
+(define-read-only (get-provider-metrics (provider-id uint) (period uint))
+  (map-get? provider-metrics { provider-id: provider-id, period: period })
+)
+
+
+
+(define-read-only (get-churn-analytics (provider-id uint))
+  (map-get? churn-analytics { provider-id: provider-id })
+)
+
+(define-read-only (get-subscription-event (event-id uint))
+  (map-get? subscription-events { event-id: event-id })
+)
+
+(define-read-only (calculate-mrr (provider-id uint))
+  (let
+    (
+      (current-period (/ stacks-block-height u144))
+      (metrics (default-to 
+        { total-subscriptions: u0, active-subscriptions: u0, total-revenue: u0, new-subscribers: u0, churned-subscribers: u0, renewal-count: u0, last-updated: u0 }
+        (map-get? provider-metrics { provider-id: provider-id, period: current-period })
+      ))
+    )
+    (ok (get total-revenue metrics))
+  )
+)
+
+(define-read-only (calculate-growth-rate (provider-id uint))
+  (let
+    (
+      (current-period (/ stacks-block-height u144))
+      (previous-period (- current-period u1))
+      (current-metrics (default-to 
+        { total-subscriptions: u0, active-subscriptions: u0, total-revenue: u0, new-subscribers: u0, churned-subscribers: u0, renewal-count: u0, last-updated: u0 }
+        (map-get? provider-metrics { provider-id: provider-id, period: current-period })
+      ))
+      (previous-metrics (default-to 
+        { total-subscriptions: u0, active-subscriptions: u0, total-revenue: u0, new-subscribers: u0, churned-subscribers: u0, renewal-count: u0, last-updated: u0 }
+        (map-get? provider-metrics { provider-id: provider-id, period: previous-period })
+      ))
+      (current-subs (get active-subscriptions current-metrics))
+      (previous-subs (get active-subscriptions previous-metrics))
+    )
+    (if (is-eq previous-subs u0)
+      (ok u0)
+      (ok (/ (* (- current-subs previous-subs) u10000) previous-subs))
+    )
+  )
+)
+
+(define-public (record-subscription-event 
+    (provider-id uint)
+    (subscription-id uint)
+    (event-type (string-ascii 16))
+    (amount uint)
+    (subscriber principal)
+  )
+  (let
+    (
+      (event-id (var-get next-event-id))
+      (current-period (/ stacks-block-height u144))
+    )
+    (map-set subscription-events
+      { event-id: event-id }
+      {
+        provider-id: provider-id,
+        subscription-id: subscription-id,
+        event-type: event-type,
+        amount: amount,
+        timestamp: stacks-block-height,
+        subscriber: subscriber
+      }
+    )
+    (var-set next-event-id (+ event-id u1))
+    ;; (try! (update-provider-metrics provider-id current-period event-type amount))
+    (ok event-id)
+  )
+)
+
+(define-private (update-provider-metrics (provider-id uint) (period uint) (event-type (string-ascii 16)) (amount uint))
+  (let
+    (
+      (current-metrics (default-to 
+        { total-subscriptions: u0, active-subscriptions: u0, total-revenue: u0, new-subscribers: u0, churned-subscribers: u0, renewal-count: u0, last-updated: u0 }
+        (map-get? provider-metrics { provider-id: provider-id, period: period })
+      ))
+      (updated-metrics (if (is-eq event-type "subscribe")
+        (merge current-metrics {
+          total-subscriptions: (+ (get total-subscriptions current-metrics) u1),
+          active-subscriptions: (+ (get active-subscriptions current-metrics) u1),
+          total-revenue: (+ (get total-revenue current-metrics) amount),
+          new-subscribers: (+ (get new-subscribers current-metrics) u1),
+          last-updated: stacks-block-height
+        })
+        (if (is-eq event-type "renew")
+          (merge current-metrics {
+            total-revenue: (+ (get total-revenue current-metrics) amount),
+            renewal-count: (+ (get renewal-count current-metrics) u1),
+            last-updated: stacks-block-height
+          })
+          (if (is-eq event-type "cancel")
+            (merge current-metrics {
+              active-subscriptions: (- (get active-subscriptions current-metrics) u1),
+              churned-subscribers: (+ (get churned-subscribers current-metrics) u1),
+              last-updated: stacks-block-height
+            })
+            current-metrics
+          )
+        )
+      ))
+    )
+    (map-set provider-metrics
+      { provider-id: provider-id, period: period }
+      updated-metrics
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-revenue-snapshot (provider-id uint))
+  (let
+    (
+      (current-period (/ stacks-block-height u144))
+      (current-metrics (default-to 
+        { total-subscriptions: u0, active-subscriptions: u0, total-revenue: u0, new-subscribers: u0, churned-subscribers: u0, renewal-count: u0, last-updated: u0 }
+        (map-get? provider-metrics { provider-id: provider-id, period: current-period })
+      ))
+      (previous-snapshot (default-to 
+        { period-revenue: u0, cumulative-revenue: u0, subscriber-count: u0 }
+        (map-get? provider-revenue-history { provider-id: provider-id, block-height: (- stacks-block-height u144) })
+      ))
+    )
+    (map-set provider-revenue-history
+      { provider-id: provider-id, block-height: stacks-block-height }
+      {
+        period-revenue: (get total-revenue current-metrics),
+        cumulative-revenue: (+ (get cumulative-revenue previous-snapshot) (get total-revenue current-metrics)),
+        subscriber-count: (get active-subscriptions current-metrics)
+      }
+    )
+    (ok true)
+  )
+)
