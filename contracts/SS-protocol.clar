@@ -9,6 +9,27 @@
 (define-constant err-subscription-expired (err u107))
 (define-constant err-invalid-period (err u108))
 
+(define-map subscription-usage
+  { subscription-id: uint }
+  {
+    current-usage: uint,
+    usage-limit: uint,
+    overage-rate: uint,
+    last-reset: uint,
+    total-overages: uint
+  }
+)
+
+(define-map usage-records
+  { subscription-id: uint, period: uint }
+  {
+    usage-count: uint,
+    overage-charges: uint,
+    period-start: uint,
+    period-end: uint
+  }
+)
+
 (define-data-var protocol-fee uint u50)
 (define-data-var fee-recipient principal contract-owner)
 
@@ -583,5 +604,159 @@
       }
     )
     (ok true)
+  )
+)
+
+
+(define-constant err-usage-limit-exceeded (err u109))
+(define-constant err-invalid-usage (err u110))
+
+(define-read-only (get-subscription-usage (subscription-id uint))
+  (map-get? subscription-usage { subscription-id: subscription-id })
+)
+
+(define-read-only (get-usage-record (subscription-id uint) (period uint))
+  (map-get? usage-records { subscription-id: subscription-id, period: period })
+)
+
+(define-read-only (get-current-usage-period)
+  (/ stacks-block-height u1008)
+)
+
+(define-public (initialize-usage-tracking 
+    (subscription-id uint)
+    (usage-limit uint)
+    (overage-rate uint)
+  )
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (asserts! (> usage-limit u0) err-invalid-usage)
+    (map-set subscription-usage
+      { subscription-id: subscription-id }
+      {
+        current-usage: u0,
+        usage-limit: usage-limit,
+        overage-rate: overage-rate,
+        last-reset: stacks-block-height,
+        total-overages: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (record-usage (subscription-id uint) (usage-amount uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+      (usage-data (unwrap! (map-get? subscription-usage { subscription-id: subscription-id }) err-not-found))
+      (current-period (get-current-usage-period))
+      (new-usage (+ (get current-usage usage-data) usage-amount))
+      (overage-amount (if (> new-usage (get usage-limit usage-data))
+                        (- new-usage (get usage-limit usage-data))
+                        u0))
+      (overage-cost (if (> overage-amount u0)
+                      (* overage-amount (get overage-rate usage-data))
+                      u0))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (asserts! (is-subscription-active subscription-id) err-subscription-inactive)
+    (asserts! (> usage-amount u0) err-invalid-usage)
+    
+    (if (> overage-cost u0)
+      (begin
+        (try! (stx-transfer? overage-cost (get subscriber subscription) (get principal provider)))
+        (map-set subscription-usage
+          { subscription-id: subscription-id }
+          (merge usage-data {
+            current-usage: new-usage,
+            total-overages: (+ (get total-overages usage-data) overage-cost)
+          })
+        )
+      )
+      (map-set subscription-usage
+        { subscription-id: subscription-id }
+        (merge usage-data { current-usage: new-usage })
+      )
+    )
+    
+    (let
+      (
+        (current-record (default-to 
+          { usage-count: u0, overage-charges: u0, period-start: stacks-block-height, period-end: (+ stacks-block-height u1008) }
+          (map-get? usage-records { subscription-id: subscription-id, period: current-period })
+        ))
+      )
+      (map-set usage-records
+        { subscription-id: subscription-id, period: current-period }
+        (merge current-record {
+          usage-count: (+ (get usage-count current-record) usage-amount),
+          overage-charges: (+ (get overage-charges current-record) overage-cost)
+        })
+      )
+    )
+    
+    (ok overage-cost)
+  )
+)
+
+(define-public (reset-usage-period (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+      (usage-data (unwrap! (map-get? subscription-usage { subscription-id: subscription-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (map-set subscription-usage
+      { subscription-id: subscription-id }
+      (merge usage-data {
+        current-usage: u0,
+        last-reset: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-usage-limit (subscription-id uint) (new-limit uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+      (usage-data (unwrap! (map-get? subscription-usage { subscription-id: subscription-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (asserts! (> new-limit u0) err-invalid-usage)
+    (map-set subscription-usage
+      { subscription-id: subscription-id }
+      (merge usage-data { usage-limit: new-limit })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (calculate-projected-overage (subscription-id uint) (projected-usage uint))
+  (match (map-get? subscription-usage { subscription-id: subscription-id })
+    usage-data 
+      (let
+        (
+          (total-projected (+ (get current-usage usage-data) projected-usage))
+          (overage-amount (if (> total-projected (get usage-limit usage-data))
+                            (- total-projected (get usage-limit usage-data))
+                            u0))
+        )
+        (ok (* overage-amount (get overage-rate usage-data)))
+      )
+    err-not-found
   )
 )
