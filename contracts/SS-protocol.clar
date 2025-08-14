@@ -760,3 +760,313 @@
     err-not-found
   )
 )
+
+(define-map subscription-sla
+  { subscription-id: uint }
+  {
+    uptime-guarantee: uint,
+    response-time-max: uint,
+    penalty-rate: uint,
+    escrow-multiplier: uint,
+    active: bool,
+    created-at: uint
+  }
+)
+
+(define-map escrow-deposits
+  { subscription-id: uint }
+  {
+    total-deposited: uint,
+    available-balance: uint,
+    locked-balance: uint,
+    last-deposit: uint,
+    auto-refill: bool
+  }
+)
+
+(define-map sla-violations
+  { violation-id: uint }
+  {
+    subscription-id: uint,
+    violation-type: (string-ascii 32),
+    severity: uint,
+    reported-at: uint,
+    verified: bool,
+    compensation-amount: uint,
+    processed: bool,
+    reporter: principal
+  }
+)
+
+(define-map provider-sla-stats
+  { provider-id: uint }
+  {
+    total-violations: uint,
+    uptime-score: uint,
+    avg-response-time: uint,
+    reputation-score: uint,
+    last-updated: uint,
+    penalty-balance: uint
+  }
+)
+
+(define-map sla-claim-periods
+  { subscription-id: uint, period: uint }
+  {
+    uptime-reported: uint,
+    downtime-incidents: uint,
+    compensation-paid: uint,
+    period-start: uint,
+    period-end: uint
+  }
+)
+
+(define-data-var next-violation-id uint u1)
+(define-constant err-insufficient-escrow (err u111))
+(define-constant err-sla-not-found (err u112))
+(define-constant err-violation-already-processed (err u113))
+(define-constant err-invalid-sla-params (err u114))
+(define-constant err-escrow-locked (err u115))
+
+(define-read-only (get-subscription-sla (subscription-id uint))
+  (map-get? subscription-sla { subscription-id: subscription-id })
+)
+
+(define-read-only (get-escrow-balance (subscription-id uint))
+  (map-get? escrow-deposits { subscription-id: subscription-id })
+)
+
+(define-read-only (get-sla-violation (violation-id uint))
+  (map-get? sla-violations { violation-id: violation-id })
+)
+
+(define-read-only (get-provider-reputation (provider-id uint))
+  (match (map-get? provider-sla-stats { provider-id: provider-id })
+    stats (get reputation-score stats)
+    u5000
+  )
+)
+
+(define-read-only (calculate-escrow-requirement (subscription-id uint))
+  (match (get-subscription-sla subscription-id)
+    sla-data
+      (match (get-subscription subscription-id)
+        subscription
+          (match (get-subscription-plan (get plan-id subscription))
+            plan
+              (ok (* (get price plan) (get escrow-multiplier sla-data)))
+            err-not-found
+          )
+        err-not-found
+      )
+    err-sla-not-found
+  )
+)
+
+(define-public (create-subscription-sla 
+    (subscription-id uint)
+    (uptime-guarantee uint)
+    (response-time-max uint)
+    (penalty-rate uint)
+    (escrow-multiplier uint)
+  )
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (asserts! (and 
+      (>= uptime-guarantee u9000)
+      (<= uptime-guarantee u10000)
+      (> response-time-max u0)
+      (<= penalty-rate u5000)
+      (and (>= escrow-multiplier u1) (<= escrow-multiplier u12))
+    ) err-invalid-sla-params)
+    
+    (map-set subscription-sla
+      { subscription-id: subscription-id }
+      {
+        uptime-guarantee: uptime-guarantee,
+        response-time-max: response-time-max,
+        penalty-rate: penalty-rate,
+        escrow-multiplier: escrow-multiplier,
+        active: true,
+        created-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (deposit-to-escrow (subscription-id uint) (amount uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (sla-data (unwrap! (map-get? subscription-sla { subscription-id: subscription-id }) err-sla-not-found))
+      (current-escrow (default-to 
+        { total-deposited: u0, available-balance: u0, locked-balance: u0, last-deposit: u0, auto-refill: false }
+        (map-get? escrow-deposits { subscription-id: subscription-id })
+      ))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    (asserts! (get active sla-data) err-sla-not-found)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrow-deposits
+      { subscription-id: subscription-id }
+      {
+        total-deposited: (+ (get total-deposited current-escrow) amount),
+        available-balance: (+ (get available-balance current-escrow) amount),
+        locked-balance: (get locked-balance current-escrow),
+        last-deposit: stacks-block-height,
+        auto-refill: (get auto-refill current-escrow)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (report-sla-violation 
+    (subscription-id uint)
+    (violation-type (string-ascii 32))
+    (severity uint)
+  )
+  (let
+    (
+      (violation-id (var-get next-violation-id))
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (sla-data (unwrap! (map-get? subscription-sla { subscription-id: subscription-id }) err-sla-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (escrow-data (unwrap! (map-get? escrow-deposits { subscription-id: subscription-id }) err-insufficient-escrow))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    (asserts! (get active sla-data) err-sla-not-found)
+    (asserts! (and (>= severity u1) (<= severity u5)) err-invalid-sla-params)
+    
+    (let
+      (
+        (base-compensation (/ (* (get price plan) (get penalty-rate sla-data)) u10000))
+        (severity-multiplier (+ u100 (* severity u50)))
+        (compensation-amount (/ (* base-compensation severity-multiplier) u100))
+      )
+      
+      (map-set sla-violations
+        { violation-id: violation-id }
+        {
+          subscription-id: subscription-id,
+          violation-type: violation-type,
+          severity: severity,
+          reported-at: stacks-block-height,
+          verified: false,
+          compensation-amount: compensation-amount,
+          processed: false,
+          reporter: tx-sender
+        }
+      )
+      
+      (var-set next-violation-id (+ violation-id u1))
+      (ok violation-id)
+    )
+  )
+)
+
+(define-public (process-sla-violation (violation-id uint))
+  (let
+    (
+      (violation (unwrap! (map-get? sla-violations { violation-id: violation-id }) err-not-found))
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: (get subscription-id violation) }) err-not-found))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id subscription) }) err-not-found))
+      (provider (unwrap! (map-get? service-providers { provider-id: (get provider-id plan) }) err-not-found))
+      (escrow-data (unwrap! (map-get? escrow-deposits { subscription-id: (get subscription-id violation) }) err-insufficient-escrow))
+    )
+    (asserts! (is-eq tx-sender (get principal provider)) err-unauthorized)
+    (asserts! (not (get processed violation)) err-violation-already-processed)
+    (asserts! (>= (get available-balance escrow-data) (get compensation-amount violation)) err-insufficient-escrow)
+    
+    (try! (as-contract (stx-transfer? 
+      (get compensation-amount violation) 
+      tx-sender 
+      (get subscriber subscription)
+    )))
+    
+    (map-set escrow-deposits
+      { subscription-id: (get subscription-id violation) }
+      (merge escrow-data {
+        available-balance: (- (get available-balance escrow-data) (get compensation-amount violation))
+      })
+    )
+    
+    (map-set sla-violations
+      { violation-id: violation-id }
+      (merge violation { verified: true, processed: true })
+    )
+    
+    (let
+      (
+        (provider-stats (default-to 
+          { total-violations: u0, uptime-score: u10000, avg-response-time: u0, reputation-score: u10000, last-updated: u0, penalty-balance: u0 }
+          (map-get? provider-sla-stats { provider-id: (get provider-id plan) })
+        ))
+        (new-violation-count (+ (get total-violations provider-stats) u1))
+        (reputation-penalty (* (get severity violation) u200))
+        (new-reputation (if (> (get reputation-score provider-stats) reputation-penalty)
+                          (- (get reputation-score provider-stats) reputation-penalty)
+                          u0))
+      )
+      (map-set provider-sla-stats
+        { provider-id: (get provider-id plan) }
+        (merge provider-stats {
+          total-violations: new-violation-count,
+          reputation-score: new-reputation,
+          last-updated: stacks-block-height,
+          penalty-balance: (+ (get penalty-balance provider-stats) (get compensation-amount violation))
+        })
+      )
+    )
+    
+    (ok (get compensation-amount violation))
+  )
+)
+
+(define-public (withdraw-escrow (subscription-id uint) (amount uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (escrow-data (unwrap! (map-get? escrow-deposits { subscription-id: subscription-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    (asserts! (>= (get available-balance escrow-data) amount) err-insufficient-escrow)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender (get subscriber subscription))))
+    
+    (map-set escrow-deposits
+      { subscription-id: subscription-id }
+      (merge escrow-data {
+        available-balance: (- (get available-balance escrow-data) amount)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (toggle-escrow-auto-refill (subscription-id uint) (enable bool))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-not-found))
+      (escrow-data (unwrap! (map-get? escrow-deposits { subscription-id: subscription-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    
+    (map-set escrow-deposits
+      { subscription-id: subscription-id }
+      (merge escrow-data { auto-refill: enable })
+    )
+    (ok true)
+  )
+)
+
+
+
