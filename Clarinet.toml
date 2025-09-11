@@ -1,0 +1,24 @@
+[project]
+name = 'SS-protocol'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.SS-protocol]
+path = 'contracts/SS-protocol.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.SubscriptionGifting]
+path = 'contracts/SubscriptionGifting.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
